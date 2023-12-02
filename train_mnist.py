@@ -8,6 +8,7 @@
 A minimal training script for DiT using PyTorch DDP.
 """
 import torch
+
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -103,11 +104,15 @@ def center_crop_arr(pil_image, image_size):
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
 
+rgb_to_grayscale = transforms.Grayscale(num_output_channels=1)
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):
+    print(args)
     """
     Trains a new DiT model.
     """
@@ -137,18 +142,27 @@ def main(args):
         logger = create_logger(None)
 
     # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
+    # assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    print("args.disable_label_conditioning: " + str(args.disable_label_conditioning))
+    latent_size = args.image_size  # // 8
+    dropout_prob = 0.1
+    if args.disable_label_conditioning:
+        dropout_prob = 0
     model = DiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        in_channels=1,
+        learn_sigma=True,
+        class_dropout_prob=dropout_prob,
+        label_conditioning=not args.disable_label_conditioning
     )
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
+    requires_grad(model)
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
@@ -156,11 +170,20 @@ def main(args):
 
     # Setup data:
     # transform = transforms.Compose([
-    #     transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+    #     # transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
     #     transforms.RandomHorizontalFlip(),
     #     transforms.ToTensor(),
     #     transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     # ])
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        rgb_to_grayscale,
+        transforms.Normalize(mean=[0.5], std=[0.5], inplace=True),
+        transforms.RandomHorizontalFlip(),
+
+        # Add any other transformations you need
+    ])
+
     dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
@@ -192,24 +215,32 @@ def main(args):
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
+
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            # print(y.shape)
+            # break
+            # show_image_batch(x, y)
+
+            # with torch.no_grad():
+            #     # Map input images to latent space + normalize latents:
+            #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+            # show_image_batch(x, y)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
+            # loss.requires_grad_()
+
             opt.zero_grad()
+            # print(loss.grad_fn)
             loss.backward()
             opt.step()
             update_ema(ema, model.module)
-
             # Log loss values:
             running_loss += loss.item()
             log_steps += 1
@@ -223,7 +254,8 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                logger.info(
+                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -255,15 +287,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-S/2")
+    parser.add_argument("--image-size", type=int, choices=[28, 32], default=28)
+    parser.add_argument("--num-classes", type=int, default=10)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--global-batch-size", type=int, default=16)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt-every", type=int, default=10000)
+    parser.add_argument('--disable-label-conditioning', action=argparse.BooleanOptionalAction,default=False)
+
+
     args = parser.parse_args()
     main(args)
