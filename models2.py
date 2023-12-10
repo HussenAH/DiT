@@ -214,16 +214,14 @@ class NPwDiTBlock(nn.Module):
         qk_norm: bool = False  # should be param see Attention origin impl
         # self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
 
-        self.q = nn.Linear(hidden_size, hidden_size * 1, bias=True)
-        self.kv = nn.Linear(hidden_size, hidden_size * 2, bias=True)
+        self.v = nn.Linear(hidden_size, hidden_size * 1, bias=True)
+        self.qk = nn.Linear(hidden_size, hidden_size * 2, bias=True)
 
         self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
         self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
 
         self.ctx_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.ctx_attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-
         self.ctx_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         # mlp_hidden_dim = int(hidden_size * mlp_ratio)
         # approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -257,28 +255,24 @@ class NPwDiTBlock(nn.Module):
         # def forward(self, x, c):
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        shift_msa2, scale_msa2, gate_msa2, shift_mlp2, scale_mlp2, gate_mlp2 = self.ctx_adaLN_modulation(c).chunk(6,
-                                                                                                                  dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
 
-        ctx = ctx + gate_msa2.unsqueeze(1) * self.ctx_attn(modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2))
-        ctx = ctx + gate_mlp2.unsqueeze(1) * self.ctx_mlp(modulate(self.ctx_norm2(ctx), shift_mlp2, scale_mlp2))
+        shift_msa2, scale_msa2, gate_msa2, shift_mlp2, scale_mlp2, gate_mlp2 = self.ctx_adaLN_modulation(c).chunk(6,
+                                                                                                                  dim=1)
+        tmp_x = modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2)
+        B, N, C = tmp_x.shape
+        qk = self.qk(tmp_x).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k = qk.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
 
-        mod_ctx = ctx  # modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2)
-        B, N, C = mod_ctx.shape
-        kv = self.kv(mod_ctx).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv.unbind(0)
-        k, v = self.q_norm(k), self.k_norm(v)
-
-        B, N, C = x.shape
-
-        q = self.q(x).reshape(B, N, 1, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-
-        x = x + gate_mlp.unsqueeze(1) * self.cross_attn(x, q, k, v)
+        v = self.v(tmp_x).reshape(B, N, 1, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        ctx = ctx + gate_msa.unsqueeze(1) * self.cross_attn(tmp_x, q, k, v)
+        ctx = ctx + gate_mlp.unsqueeze(1) * self.ctx_mlp(modulate(self.ctx_norm2(ctx), shift_mlp2, scale_mlp2))
 
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.ctx_adaLN_modulation(c).chunk(6, dim=1)
 
-        return x
+        return x + ctx
 
 
 class FinalLayer(nn.Module):
@@ -760,9 +754,6 @@ class NPwDiT_Wrap(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.initialize_weights()
-        self.sampling = False
-        self.pc = None
-        self.vc = None
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -816,20 +807,6 @@ class NPwDiT_Wrap(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def set_context(self, ctx):
-        pos_embd = self.pos_embed
-        ctx = self.x_embedder(ctx)
-        pc = pos_embd
-        vc = ctx
-
-        half_sequence_length = vc.size(1) // 2
-        upper_half_indices = slice(0, half_sequence_length)
-
-        self.pc = pc[:, upper_half_indices, :]
-        self.vc = vc[:, upper_half_indices, :]
-
-        self.sampling = True
-
     # def forward(self, x, pc,vc,pt, t, y):
     """
     x- the image + noise 
@@ -847,25 +824,12 @@ class NPwDiT_Wrap(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x2 = x
+
         pos_embd = self.pos_embed
         x = self.x_embedder(x)
         pt = pos_embd
         pc = pos_embd
         vc = x
-
-        if self.sampling:
-            # print("sampling")
-
-            pc = self.pc
-            vc = self.vc
-        else:
-            # print("training")
-            half_sequence_length = vc.size(1) // 2
-            upper_half_indices = slice(0, half_sequence_length)
-
-            pc = pc[:, upper_half_indices, :]
-            vc = vc[:, upper_half_indices, :]
 
         # x = self.x_embedder(x) #+ self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)  # (N, D)
@@ -882,39 +846,7 @@ class NPwDiT_Wrap(nn.Module):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        print("forward_with_cfg")
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
-
-    def forward_with_context(self, x, t, y, cfg_scale):
-        """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
-        """
-        print("forward_with_cfg")
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        return None
 
 
 #################################################################################
