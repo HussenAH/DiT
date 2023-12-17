@@ -840,19 +840,20 @@ class NPwDiT_Wrap(nn.Module):
 
     """
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y,ctx):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
-        x2 = x
+        # x2 = x
         pos_embd = self.pos_embed
         x = self.x_embedder(x)
+        ctx = self.x_embedder(ctx)
         pt = pos_embd
         pc = pos_embd
-        vc = x
+        vc = ctx
 
         if self.sampling:
             # print("sampling")
@@ -882,39 +883,59 @@ class NPwDiT_Wrap(nn.Module):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        print("forward_with_cfg")
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        # print("forward_with_cfg")
+        # # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        # half = x[: len(x) // 2]
+        # combined = torch.cat([half, half], dim=0)
+        # model_out = self.forward(combined, t, y)
+        # # For exact reproducibility reasons, we apply classifier-free guidance on only
+        # # three channels by default. The standard approach to cfg applies it to all channels.
+        # # This can be done by uncommenting the following line and commenting-out the line following that.
+        # # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
+        # eps, rest = model_out[:, :3], model_out[:, 3:]
+        # cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+        # half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        # eps = torch.cat([half_eps, half_eps], dim=0)
+        # return torch.cat([eps, rest], dim=1)
 
-    def forward_with_context(self, x, t, y, cfg_scale):
+        # model_out = self.forward(x,t,y)
+        # return model_out
+
+        ctx = cfg_scale
+
+        pos_embd = self.pos_embed
+        x = self.x_embedder(x)
+        ctx = self.x_embedder(ctx)
+        pt = pos_embd
+        pc = pos_embd
+        vc = ctx
+
+        # print("training")
+        half_sequence_length = vc.size(1) // 2
+        upper_half_indices = slice(0, half_sequence_length)
+
+        pc = pc[:, upper_half_indices, :]
+        vc = vc[:, upper_half_indices, :]
+
+        # x = self.x_embedder(x) #+ self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        t = self.t_embedder(t)  # (N, D)
+        y = self.y_embedder(y, self.training)  # (N, D)
+        if not self.label_conditioning:
+            # print('no label cond')
+            y[:] = 0
+
+        x = self.dit_model(x, pc, vc, pt, t, y)  # self.dit_model(x, t, y)
+        x = self.unpatchify(x)  # (N, out_channels, H, W)
+        return x
+
+    def forward_with_context(self, x, t, y, ctx):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
-        print("forward_with_cfg")
-        # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        # For exact reproducibility reasons, we apply classifier-free guidance on only
-        # three channels by default. The standard approach to cfg applies it to all channels.
-        # This can be done by uncommenting the following line and commenting-out the line following that.
-        # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+        print("forward_with_context")
+
+        model_out = self.forward(x, t, y)
+        return model_out
 
 
 #################################################################################

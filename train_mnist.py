@@ -231,7 +231,7 @@ def main(args):
             #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             # show_image_batch(x, y)
-            model_kwargs = dict(y=y)
+            model_kwargs = dict(y=y,ctx=x)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             # loss.requires_grad_()
