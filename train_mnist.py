@@ -111,6 +111,41 @@ rgb_to_grayscale = transforms.Grayscale(num_output_channels=1)
 #                                  Training Loop                                #
 #################################################################################
 
+def create_context_embedded_indexes(image_size):
+    def map_pixel_to_embedded(pixel_position):
+        # Define the dimensions of the original image and the embedded vector
+        image_height, image_width = image_size, image_size
+        embedded_size = image_height * image_width
+
+        # Unpack the pixel position
+        row, col = pixel_position
+
+        # Check if the given pixel position is within bounds
+        if row < 0 or row >= image_height or col < 0 or col >= image_width:
+            raise ValueError("Pixel position is out of bounds for a 28x28 image")
+
+        # Calculate the index in the flattened embedded vector corresponding to the pixel position
+        embedded_index = row * image_width + col
+
+        return embedded_index
+
+    # Ensure the input image has dimensions 28x28
+    # if image.shape != (28, 28):
+    #     raise ValueError("Input image should have dimensions 28x28")
+
+    # Generate a random number of pixels to map (between 1 and total number of pixels in the image)
+    num_pixels = np.random.randint(1, image_size * image_size + 1)
+
+    # Generate random pixel positions
+    random_pixels = [(np.random.randint(0, image_size), np.random.randint(0, image_size)) for _ in
+                     range(num_pixels)]
+
+    # Map pixel positions to embedded indexes
+    embedded_indexes = [map_pixel_to_embedded(pixel) for pixel in random_pixels]
+
+    return embedded_indexes
+
+
 def main(args):
     print(args)
     """
@@ -231,7 +266,11 @@ def main(args):
             #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             # show_image_batch(x, y)
-            model_kwargs = dict(y=y,ctx=x)
+            ctx_indexes = create_context_embedded_indexes(args.image_size)
+            # print(t)
+            # print(len(ctx_indexes))
+            # print(ctx_indexes)
+            model_kwargs = dict(y=y, ctx=x, ctx_indexes=ctx_indexes)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             # loss.requires_grad_()
@@ -297,8 +336,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=10000)
-    parser.add_argument('--disable-label-conditioning', action=argparse.BooleanOptionalAction,default=False)
-
+    parser.add_argument('--disable-label-conditioning', action=argparse.BooleanOptionalAction, default=False)
 
     args = parser.parse_args()
     main(args)

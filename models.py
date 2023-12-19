@@ -749,6 +749,7 @@ class NPwDiT_Wrap(nn.Module):
                                 learn_sigma=learn_sigma,
                                 label_conditioning=label_conditioning)
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.input_size = input_size
         self.label_conditioning = label_conditioning
         if not self.label_conditioning:
             class_dropout_prob = 0
@@ -816,20 +817,6 @@ class NPwDiT_Wrap(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def set_context(self, ctx):
-        pos_embd = self.pos_embed
-        ctx = self.x_embedder(ctx)
-        pc = pos_embd
-        vc = ctx
-
-        half_sequence_length = vc.size(1) // 2
-        upper_half_indices = slice(0, half_sequence_length)
-
-        self.pc = pc[:, upper_half_indices, :]
-        self.vc = vc[:, upper_half_indices, :]
-
-        self.sampling = True
-
     # def forward(self, x, pc,vc,pt, t, y):
     """
     x- the image + noise 
@@ -840,7 +827,7 @@ class NPwDiT_Wrap(nn.Module):
 
     """
 
-    def forward(self, x, t, y,ctx):
+    def forward(self, x, t, y,ctx, ctx_indexes):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -855,18 +842,12 @@ class NPwDiT_Wrap(nn.Module):
         pc = pos_embd
         vc = ctx
 
-        if self.sampling:
-            # print("sampling")
+        # print("training")
+        # half_sequence_length = vc.size(1) // 2
+        # upper_half_indices = slice(0, half_sequence_length)
 
-            pc = self.pc
-            vc = self.vc
-        else:
-            # print("training")
-            half_sequence_length = vc.size(1) // 2
-            upper_half_indices = slice(0, half_sequence_length)
-
-            pc = pc[:, upper_half_indices, :]
-            vc = vc[:, upper_half_indices, :]
+        pc = pc[:, ctx_indexes, :]
+        vc = vc[:, ctx_indexes, :]
 
         # x = self.x_embedder(x) #+ self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)  # (N, D)
