@@ -36,11 +36,8 @@ class CrossAttention(nn.Module):
             self,
             dim: int,
             num_heads: int = 8,
-            qkv_bias: bool = False,
-            qk_norm: bool = False,
             attn_drop: float = 0.,
             proj_drop: float = 0.,
-            norm_layer: nn.Module = nn.LayerNorm,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -49,9 +46,7 @@ class CrossAttention(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.fused_attn = use_fused_attn()
 
-        # self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        # self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        # self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
@@ -59,9 +54,7 @@ class CrossAttention(nn.Module):
     def forward(self, x, q, k, v) -> torch.Tensor:
         # def forward(self, x) -> torch.Tensor:
         B, N, C = x.shape
-        #     qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        #     q, k, v = qkv.unbind(0)
-        #     q, k = self.q_norm(q), self.k_norm(k)
+
 
         if self.fused_attn:
             x = F.scaled_dot_product_attention(
@@ -183,101 +176,6 @@ class DiTBlock(nn.Module):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
-
-
-class NPwDiTBlock(nn.Module):
-    """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
-    """
-
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
-        super().__init__()
-
-        # tmp for qkv
-        self.num_heads = num_heads
-        self.hidden_size = hidden_size
-        self.head_dim = hidden_size // num_heads
-
-        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
-
-        # ====== context block part ===============
-        qk_norm: bool = False  # should be param see Attention origin impl
-        # self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
-
-        self.q = nn.Linear(hidden_size, hidden_size * 1, bias=True)
-        self.kv = nn.Linear(hidden_size, hidden_size * 2, bias=True)
-
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-
-        self.ctx_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        self.ctx_attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-
-        self.ctx_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        # mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        # approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.ctx_mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.ctx_adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
-
-    # def forward(self, x, ctx, c):
-    # # def forward(self, x, c):
-    #
-    #     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-    #     x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-    #     x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-    #     shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.ctx_adaLN_modulation(c).chunk(6, dim=1)
-    #
-    #     tmp_x = modulate(self.ctx_norm1(ctx), shift_msa, scale_msa)
-    #     B, N, C = tmp_x.shape
-    #     qkv = self.qkv(tmp_x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-    #     q, k, v = qkv.unbind(0)
-    #     q, k = self.q_norm(q), self.k_norm(k)
-    #
-    #     ctx = ctx + gate_msa.unsqueeze(1) * self.cross_attn(tmp_x, q, k, v)
-    #     # ctx = ctx + gate_msa.unsqueeze(1) * self.cross_attn(modulate(self.ctx_norm1(ctx), shift_msa, scale_msa))
-    #     ctx = ctx + gate_mlp.unsqueeze(1) * self.ctx_mlp(modulate(self.ctx_norm2(ctx), shift_mlp, scale_mlp))
-    #
-    #     return x + ctx
-
-    def forward(self, x, ctx, c):
-        # def forward(self, x, c):
-
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        shift_msa2, scale_msa2, gate_msa2, shift_mlp2, scale_mlp2, gate_mlp2 = self.ctx_adaLN_modulation(c).chunk(6,
-                                                                                                                  dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-
-        ctx = ctx + gate_msa2.unsqueeze(1) * self.ctx_attn(modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2))
-        ctx = ctx + gate_mlp2.unsqueeze(1) * self.ctx_mlp(modulate(self.ctx_norm2(ctx), shift_mlp2, scale_mlp2))
-
-        mod_ctx = ctx  # modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2)
-        B, N, C = mod_ctx.shape
-        kv = self.kv(mod_ctx).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv.unbind(0)
-        k, v = self.q_norm(k), self.k_norm(v)
-
-        B, N, C = x.shape
-
-        q = self.q(x).reshape(B, N, 1, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-
-        x = x + gate_mlp.unsqueeze(1) * self.cross_attn(x, q, k, v)
-
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-
         return x
 
 
@@ -438,7 +336,82 @@ class DiT(nn.Module):
         return torch.cat([eps, rest], dim=1)
 
 
-class NPwDiT(nn.Module):
+class DiPTBlock(nn.Module):
+    """
+    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    """
+
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
+        super().__init__()
+
+        # tmp for qkv
+        self.num_heads = num_heads
+        self.hidden_size = hidden_size
+        self.head_dim = hidden_size // num_heads
+
+        self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+        # ====== context block part ===============
+        qk_norm: bool = False  # should be param see Attention origin impl
+        # self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=True)
+
+        self.q = nn.Linear(hidden_size, hidden_size * 1, bias=True)
+        self.kv = nn.Linear(hidden_size, hidden_size * 2, bias=True)
+
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+
+        self.ctx_norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.cross_attn = CrossAttention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        self.ctx_attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+
+        self.ctx_norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        # mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        # approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.ctx_mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.ctx_adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
+
+
+    def forward(self, x, ctx, c):
+        # def forward(self, x, c):
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        shift_msa2, scale_msa2, gate_msa2, shift_mlp2, scale_mlp2, gate_mlp2 = self.ctx_adaLN_modulation(c).chunk(6,
+                                                                                                                  dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+
+        ctx = ctx + gate_msa2.unsqueeze(1) * self.ctx_attn(modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2))
+        ctx = ctx + gate_mlp2.unsqueeze(1) * self.ctx_mlp(modulate(self.ctx_norm2(ctx), shift_mlp2, scale_mlp2))
+
+        mod_ctx = ctx  # modulate(self.ctx_norm1(ctx), shift_msa2, scale_msa2)
+        B, N, C = mod_ctx.shape
+        kv = self.kv(mod_ctx).reshape(B, N, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        k, v = kv.unbind(0)
+        k, v = self.q_norm(k), self.k_norm(v)
+
+        B, N, C = x.shape
+
+        q = self.q(x).reshape(B, N, 1, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+
+        x = x + gate_mlp.unsqueeze(1) * self.cross_attn(x, q, k, v)
+
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
+        return x
+
+class DiPT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     """
@@ -474,7 +447,7 @@ class NPwDiT(nn.Module):
         # self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            NPwDiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiPTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
 
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -584,7 +557,8 @@ class NPwDiT(nn.Module):
 #                   External Positional Embedding Functions                  #
 #################################################################################
 
-class DiT_Wrap(nn.Module):
+
+class DiPT_Wrap(nn.Module):
     """
     Diffusion model with a Transformer backbone.
     """
@@ -605,149 +579,17 @@ class DiT_Wrap(nn.Module):
     ):
         super().__init__()
 
-        self.dit_model = DiT(input_size=input_size,
-                             patch_size=patch_size,
-                             in_channels=in_channels,
-                             hidden_size=hidden_size,
-                             depth=depth,
-                             num_heads=num_heads,
-                             mlp_ratio=mlp_ratio,
-                             class_dropout_prob=class_dropout_prob,
-                             num_classes=num_classes,
-                             learn_sigma=learn_sigma,
-                             label_conditioning=label_conditioning)
-        self.out_channels = in_channels * 2 if learn_sigma else in_channels
-        self.label_conditioning = label_conditioning
-        if not self.label_conditioning:
-            class_dropout_prob = 0
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
-
-        self.initialize_weights()
-
-    def initialize_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-
-        self.apply(_basic_init)
-
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # # Zero-out adaLN modulation layers in DiT blocks:
-        # for block in self.blocks:
-        #     nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-        #     nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        #
-        # # Zero-out output layers:
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        # nn.init.constant_(self.final_layer.linear.weight, 0)
-        # nn.init.constant_(self.final_layer.linear.bias, 0)
-
-    def unpatchify(self, x):
-        """
-        x: (N, T, patch_size**2 * C)
-        imgs: (N, H, W, C)
-        """
-        c = self.out_channels
-        p = self.x_embedder.patch_size[0]
-        h = w = int(x.shape[1] ** 0.5)
-        assert h * w == x.shape[1]
-
-        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-        x = torch.einsum('nhwpqc->nchpwq', x)
-        imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
-        return imgs
-
-    # def forward(self, x, pc,vc,pt, t, y):
-    """
-    x- the image + noise 
-    pc: pos contex -> pos of the tokens (pix) 
-    vc: value of the context -> the true image (set of tokens (pix) ) 
-    pt: pos. target 
-    return : vt -> value of the target 
-
-    """
-
-    def forward(self, x, t, y):
-        """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)  # (N, D)
-        y = self.y_embedder(y, self.training)  # (N, D)
-        if not self.label_conditioning:
-            # print('no label cond')
-            y[:] = 0
-
-        x = self.dit_model(x, t, y)  # self.dit_model(x, t, y)
-        x = self.unpatchify(x)  # (N, out_channels, H, W)
-        return x
-
-    def forward_with_cfg(self, x, t, y, cfg_scale):
-        """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
-        """
-        return None
-
-
-class NPwDiT_Wrap(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
-
-    def __init__(
-            self,
-            input_size=32,
-            patch_size=2,
-            in_channels=4,
-            hidden_size=1152,
-            depth=28,
-            num_heads=16,
-            mlp_ratio=4.0,
-            class_dropout_prob=0.1,
-            num_classes=1000,
-            learn_sigma=True,
-            label_conditioning=True
-    ):
-        super().__init__()
-
-        self.dit_model = NPwDiT(input_size=input_size,
-                                patch_size=patch_size,
-                                in_channels=in_channels,
-                                hidden_size=hidden_size,
-                                depth=depth,
-                                num_heads=num_heads,
-                                mlp_ratio=mlp_ratio,
-                                class_dropout_prob=class_dropout_prob,
-                                num_classes=num_classes,
-                                learn_sigma=learn_sigma,
-                                label_conditioning=label_conditioning)
+        self.dit_model = DiPT(input_size=input_size,
+                              patch_size=patch_size,
+                              in_channels=in_channels,
+                              hidden_size=hidden_size,
+                              depth=depth,
+                              num_heads=num_heads,
+                              mlp_ratio=mlp_ratio,
+                              class_dropout_prob=class_dropout_prob,
+                              num_classes=num_classes,
+                              learn_sigma=learn_sigma,
+                              label_conditioning=label_conditioning)
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.input_size = input_size
         self.label_conditioning = label_conditioning
@@ -791,16 +633,6 @@ class NPwDiT_Wrap(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # # Zero-out adaLN modulation layers in DiT blocks:
-        # for block in self.blocks:
-        #     nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-        #     nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-        #
-        # # Zero-out output layers:
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        # nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        # nn.init.constant_(self.final_layer.linear.weight, 0)
-        # nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def unpatchify(self, x):
         """
@@ -1018,12 +850,9 @@ def DiT_S_1(**kwargs):
     return DiT(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
 
 
-def DiT_S_1_Wrap(**kwargs):
-    return DiT_Wrap(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
 
-
-def NPwDiT_S_1_Wrap(**kwargs):
-    return NPwDiT_Wrap(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
+def DiPT_S_1_Wrap(**kwargs):
+    return DiPT_Wrap(depth=12, hidden_size=384, patch_size=1, num_heads=6, **kwargs)
 
 
 def DiT_S_2(**kwargs):
@@ -1043,5 +872,5 @@ DiT_models = {
     'DiT-L/2': DiT_L_2, 'DiT-L/4': DiT_L_4, 'DiT-L/8': DiT_L_8,
     'DiT-B/2': DiT_B_2, 'DiT-B/4': DiT_B_4, 'DiT-B/8': DiT_B_8,
     'DiT-S/2': DiT_S_2, 'DiT-S/4': DiT_S_4, 'DiT-S/8': DiT_S_8, 'DiT-S/1': DiT_S_1,
-    'DiT-S/1-Wrap': DiT_S_1_Wrap, 'NPwDiT-S/1-Wrap': NPwDiT_S_1_Wrap,
+    'DiPT-S/1-Wrap': DiPT_S_1_Wrap,
 }
