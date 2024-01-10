@@ -36,8 +36,12 @@ class CrossAttention(nn.Module):
             self,
             dim: int,
             num_heads: int = 8,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
             attn_drop: float = 0.,
             proj_drop: float = 0.,
+            norm_layer: nn.Module = nn.LayerNorm,
+
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
