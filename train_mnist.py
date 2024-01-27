@@ -8,7 +8,6 @@
 A minimal training script for DiT using PyTorch DDP.
 """
 import torch
-
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -32,6 +31,20 @@ from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
+###############
+# TEMP replace AttrDict that was broken since 3.10
+###############
+
+from collections import UserDict
+# from attrdict import AttrDict
+
+class AttrDict(UserDict):
+    def __getattr__(self, key):
+        return self.__getitem__(key)
+    def __setattr__(self, key, value):
+        if key == "data":
+            return super().__setattr__(key, value)
+        return self.__setitem__(key, value)
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -111,7 +124,41 @@ rgb_to_grayscale = transforms.Grayscale(num_output_channels=1)
 #                                  Training Loop                                #
 #################################################################################
 
-def create_context_embedded_indexes(image_size):
+# def create_context_embedded_indexes(image_size):
+#     def map_pixel_to_embedded(pixel_position):
+#         # Define the dimensions of the original image and the embedded vector
+#         image_height, image_width = image_size, image_size
+#         embedded_size = image_height * image_width
+#
+#         # Unpack the pixel position
+#         row, col = pixel_position
+#
+#         # Check if the given pixel position is within bounds
+#         if row < 0 or row >= image_height or col < 0 or col >= image_width:
+#             raise ValueError("Pixel position is out of bounds for a 28x28 image")
+#
+#         # Calculate the index in the flattened embedded vector corresponding to the pixel position
+#         embedded_index = row * image_width + col
+#
+#         return embedded_index
+#
+#     # Ensure the input image has dimensions 28x28
+#     # if image.shape != (28, 28):
+#     #     raise ValueError("Input image should have dimensions 28x28")
+#
+#     # Generate a random number of pixels to map (between 1 and total number of pixels in the image)
+#     num_pixels = np.random.randint(1, image_size * image_size + 1)
+#
+#     # Generate random pixel positions
+#     random_pixels = [(np.random.randint(0, image_size), np.random.randint(0, image_size)) for _ in
+#                      range(num_pixels)]
+#
+#     # Map pixel positions to embedded indexes
+#     embedded_indexes = [map_pixel_to_embedded(pixel) for pixel in random_pixels]
+#
+#     return embedded_indexes
+
+def create_context_embedded_indexes(image_size, max_num_pixels=None, complete_image=False):
     def map_pixel_to_embedded(pixel_position):
         # Define the dimensions of the original image and the embedded vector
         image_height, image_width = image_size, image_size
@@ -129,12 +176,21 @@ def create_context_embedded_indexes(image_size):
 
         return embedded_index
 
-    # Ensure the input image has dimensions 28x28
-    # if image.shape != (28, 28):
-    #     raise ValueError("Input image should have dimensions 28x28")
+    if complete_image:
+        # Generate all possible pixel positions
+        all_pixels = [(i, j) for i in range(image_size) for j in range(image_size)]
+
+        # Map all pixel positions to embedded indexes
+        all_embedded_indexes = [map_pixel_to_embedded(pixel) for pixel in all_pixels]
+
+        return all_embedded_indexes, all_pixels
 
     # Generate a random number of pixels to map (between 1 and total number of pixels in the image)
-    num_pixels = np.random.randint(1, image_size * image_size + 1)
+    num_pixels = np.random.randint(1, image_size * image_size + 1
+    if max_num_pixels is None else max_num_pixels)
+
+    # Generate a random number of pixels to map (between 1 and total number of pixels in the image)
+    # num_pixels = np.random.randint(1, image_size * image_size + 1)
 
     # Generate random pixel positions
     random_pixels = [(np.random.randint(0, image_size), np.random.randint(0, image_size)) for _ in
@@ -143,7 +199,7 @@ def create_context_embedded_indexes(image_size):
     # Map pixel positions to embedded indexes
     embedded_indexes = [map_pixel_to_embedded(pixel) for pixel in random_pixels]
 
-    return embedded_indexes
+    return embedded_indexes, random_pixels
 
 
 def main(args):
@@ -250,7 +306,7 @@ def main(args):
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
-
+    max_num_pixels = int(args.image_size * args.image_size * 0.7)
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
@@ -264,13 +320,28 @@ def main(args):
             # with torch.no_grad():
             #     # Map input images to latent space + normalize latents:
             #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+
+            "===== temp -> replace by image to task from NP code ===="
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             # show_image_batch(x, y)
-            ctx_indexes = create_context_embedded_indexes(args.image_size)
+            ctx_indexes,_ = create_context_embedded_indexes(args.image_size, max_num_pixels, complete_image=False)
+            target_indexes,_ = create_context_embedded_indexes(args.image_size, args.image_size * args.image_size,
+                                                             complete_image=True)
+            all_indexes,_ = create_context_embedded_indexes(args.image_size, args.image_size * args.image_size,
+                                                             complete_image=True)
+            batch =  AttrDict()
+            batch.x = all_indexes
+            batch.y = x
+            batch.xc = ctx_indexes
+            batch.yc = None
+            batch.xt = target_indexes
+            batch.yt = None
+
+            "========================================================="
             # print(t)
             # print(len(ctx_indexes))
             # print(ctx_indexes)
-            model_kwargs = dict(y=y, ctx=x, ctx_indexes=ctx_indexes)
+            model_kwargs = dict(y=y, batch=batch,  num_samples=None, reduce_ll=True)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
             loss = loss_dict["loss"].mean()
             # loss.requires_grad_()
